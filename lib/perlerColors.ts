@@ -12,6 +12,11 @@ export const PERLER_PALETTE: PerlerColor[] = [
   { name: "Black", hex: "#1a1a1a" },
   { name: "Red", hex: "#d0121b" },
   { name: "Orange", hex: "#f47b20" },
+  // Fills a real gap between vivid Orange and dark Brown -- without it, any
+  // shadowed or rust-toned part of an orange subject (a pumpkin's ridges,
+  // say) has nowhere good to land and gets matched to Red or Brown instead,
+  // standing out in a way the photo never actually looked like.
+  { name: "Burnt Orange", hex: "#b5451d" },
   { name: "Yellow", hex: "#fde01a" },
   { name: "Pastel Yellow", hex: "#fbe8a6" },
   { name: "Cream", hex: "#f3e5c3" },

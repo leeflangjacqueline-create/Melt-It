@@ -56,6 +56,17 @@ export default function ImageCropZoom({ imageUrl, onApply, onCancel }: Props) {
     startClientX: number;
     startClientY: number;
     startOffset: Offset;
+    // The frame's size and the image's display scale, measured once right
+    // when the drag starts. Re-measuring these on every single pointermove
+    // (there can be dozens a second while dragging) forces the browser to
+    // stop and recalculate the page layout before it can answer -- on a
+    // phone, that was enough to make dragging feel like it was crawling a
+    // couple of pixels at a time instead of following your finger. Neither
+    // of these actually changes mid-drag, so measuring them once up front
+    // and reusing them is both correct and far smoother.
+    frameWidth: number;
+    frameHeight: number;
+    scale: number;
   } | null>(null);
 
   // How much the image is scaled up just to fully cover the frame with no
@@ -71,25 +82,37 @@ export default function ImageCropZoom({ imageUrl, onApply, onCancel }: Props) {
     return Math.max(rect.width / naturalSize.width, rect.height / naturalSize.height);
   }
 
-  // Keeps the image from being dragged or zoomed so far that empty space
-  // would show inside the frame -- the image's edges are never allowed to
-  // move past the frame's edges.
-  function clampOffset(offset: Offset, scale: number): Offset {
-    const frame = frameRef.current;
-    if (!frame || !naturalSize) return offset;
-    const rect = frame.getBoundingClientRect();
+  // The actual clamping math, given the frame's size directly rather than
+  // measuring it -- so the fast-moving drag loop below can reuse a
+  // measurement it already took, instead of asking the browser to
+  // recalculate the page layout on every call.
+  function clampOffsetTo(offset: Offset, scale: number, frameWidth: number, frameHeight: number): Offset {
+    if (!naturalSize) return offset;
     const displayWidth = naturalSize.width * scale;
     const displayHeight = naturalSize.height * scale;
 
     const x =
-      displayWidth <= rect.width
-        ? (rect.width - displayWidth) / 2
-        : Math.min(0, Math.max(rect.width - displayWidth, offset.x));
+      displayWidth <= frameWidth
+        ? (frameWidth - displayWidth) / 2
+        : Math.min(0, Math.max(frameWidth - displayWidth, offset.x));
     const y =
-      displayHeight <= rect.height
-        ? (rect.height - displayHeight) / 2
-        : Math.min(0, Math.max(rect.height - displayHeight, offset.y));
+      displayHeight <= frameHeight
+        ? (frameHeight - displayHeight) / 2
+        : Math.min(0, Math.max(frameHeight - displayHeight, offset.y));
     return { x, y };
+  }
+
+  // Keeps the image from being dragged or zoomed so far that empty space
+  // would show inside the frame -- the image's edges are never allowed to
+  // move past the frame's edges. Measures the frame fresh each time, which
+  // is fine for the occasional call (loading, the zoom slider, a window
+  // resize) but too slow to call on every pointermove during a drag -- see
+  // handlePointerMove below.
+  function clampOffset(offset: Offset, scale: number): Offset {
+    const frame = frameRef.current;
+    if (!frame) return offset;
+    const rect = frame.getBoundingClientRect();
+    return clampOffsetTo(offset, scale, rect.width, rect.height);
   }
 
   function centeredOffset(scale: number): Offset {
@@ -103,8 +126,10 @@ export default function ImageCropZoom({ imageUrl, onApply, onCancel }: Props) {
   }
 
   // Pushes the current zoom + pan onto the actual <img> element's style.
-  // Called directly (not through React render) so dragging and the zoom
-  // slider both feel immediate.
+  // Called directly (not through React render) so the zoom slider feels
+  // immediate. Resizes the image too, so only use this when the zoom level
+  // might have changed -- for a plain drag, where only the position moves,
+  // applyPan() below does the same job far more cheaply.
   function applyTransform() {
     const img = imgRef.current;
     if (!img || !naturalSize) return;
@@ -112,6 +137,16 @@ export default function ImageCropZoom({ imageUrl, onApply, onCancel }: Props) {
     img.style.width = `${naturalSize.width * scale}px`;
     img.style.height = `${naturalSize.height * scale}px`;
     img.style.transform = `translate(${offsetRef.current.x}px, ${offsetRef.current.y}px)`;
+  }
+
+  // The drag-loop version of the line above: just repositions the image,
+  // without touching its size or asking the browser to measure anything
+  // first. This is what keeps a drag feeling instant -- see the comment on
+  // dragRef's type above for why the full applyTransform() was too slow to
+  // call on every pointermove.
+  function applyPan() {
+    const img = imgRef.current;
+    if (img) img.style.transform = `translate(${offsetRef.current.x}px, ${offsetRef.current.y}px)`;
   }
 
   // The moment the image finishes loading, we know its real size, which is
@@ -186,26 +221,39 @@ export default function ImageCropZoom({ imageUrl, onApply, onCancel }: Props) {
     if (isLoading || !naturalSize) return;
     // Ignore a second finger if one is already dragging.
     if (dragRef.current !== null) return;
-    frameRef.current?.setPointerCapture(e.pointerId);
+    const frame = frameRef.current;
+    if (!frame) return;
+    frame.setPointerCapture(e.pointerId);
+    // Measure the frame once, right now, rather than on every move event
+    // below -- see the comment on dragRef's type above.
+    const rect = frame.getBoundingClientRect();
     dragRef.current = {
       pointerId: e.pointerId,
       startClientX: e.clientX,
       startClientY: e.clientY,
       startOffset: { ...offsetRef.current },
+      frameWidth: rect.width,
+      frameHeight: rect.height,
+      scale: getCoverScale() * zoom,
     };
   }
 
   function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) return;
-    const scale = getCoverScale() * zoom;
     const dx = e.clientX - drag.startClientX;
     const dy = e.clientY - drag.startClientY;
-    offsetRef.current = clampOffset(
+    // No DOM measurement here on purpose -- everything needed (frame size,
+    // scale) was already captured in dragRef when the drag started, so this
+    // is pure arithmetic plus one cheap style write, and can keep up with
+    // a finger moving quickly across the screen.
+    offsetRef.current = clampOffsetTo(
       { x: drag.startOffset.x + dx, y: drag.startOffset.y + dy },
-      scale
+      drag.scale,
+      drag.frameWidth,
+      drag.frameHeight
     );
-    applyTransform();
+    applyPan();
   }
 
   function endDrag(e: React.PointerEvent<HTMLDivElement>) {
