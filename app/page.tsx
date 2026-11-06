@@ -23,15 +23,20 @@ import { convertHeicToJpeg, isHeicFile, withJpegExtension } from "@/lib/heicConv
 import { removeBackground } from "@/lib/backgroundRemoval";
 import { savePatternToLibrary } from "@/lib/patternLibrary";
 import ManualTouchUp from "./components/ManualTouchUp";
+import ImageCropZoom from "./components/ImageCropZoom";
 import PatternLibrary from "./components/PatternLibrary";
 
-// The two upload choices. Both use the same file picker under the hood,
-// but we remember which one the user picked so later steps can treat
-// photos and screenshots differently if we want to.
-type UploadSource = "photo" | "screenshot";
+// How the current image arrived -- just used for the friendly caption
+// under the preview ("taken with your camera", etc.), since the upload
+// button itself no longer distinguishes photos from screenshots.
+type UploadSource = "upload" | "camera" | "paste";
 
 type SelectedImage = {
-  originalUrl: string; // the image exactly as uploaded (after any HEIC conversion)
+  // The current base image -- the file exactly as uploaded/captured/pasted,
+  // or as cropped/zoomed since (see ImageCropZoom). "Remove background"
+  // and manual touch-up always start fresh from this, never from a
+  // previous background-removal attempt.
+  originalUrl: string;
   processedUrl: string | null; // set once "Remove background" succeeds
   name: string;
   sizeKb: number;
@@ -115,6 +120,9 @@ export default function Home() {
   // Whether the manual "erase by hand" popup is currently open.
   const [showTouchUp, setShowTouchUp] = useState(false);
 
+  // Whether the crop/zoom popup is currently open.
+  const [showCropZoom, setShowCropZoom] = useState(false);
+
   // The generated pattern (null until "Generate pattern" is clicked and
   // succeeds), plus loading/error state for that async step.
   const [pattern, setPattern] = useState<Pattern | null>(null);
@@ -171,12 +179,13 @@ export default function Home() {
   // The <canvas> we draw the pattern onto.
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // A reference to the hidden <input type="file">. The two buttons below
-  // "click" it for us, so we only need one input.
+  // References to the two hidden <input type="file"> elements. They're
+  // identical except the second one adds `capture="environment"`, which
+  // tells a phone browser to open the camera directly instead of the normal
+  // file picker -- that difference has to be set in the HTML itself, so we
+  // need two separate inputs rather than one shared one.
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  // Remembers which button was pressed, so onChange knows the source.
-  const pendingSource = useRef<UploadSource>("photo");
+  const cameraInputRef = useRef<HTMLInputElement>(null);
 
   // The image actually used for the preview and for generating a pattern:
   // the background-removed version if we have one, otherwise the original.
@@ -197,23 +206,29 @@ export default function Home() {
     }
   }, [pattern]);
 
-  function openPicker(source: UploadSource) {
-    pendingSource.current = source;
+  function openFilePicker() {
     fileInputRef.current?.click();
   }
 
-  async function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) return; // user cancelled the picker
+  function openCamera() {
+    cameraInputRef.current?.click();
+  }
 
-    // Reset the input so choosing the same file again still triggers onChange.
-    event.target.value = "";
+  // The shared core of "a new image showed up," however it arrived --
+  // picked from the file browser, captured by the camera, or pasted from
+  // the clipboard. Validates it, converts it from HEIC if needed, and makes
+  // it the new selected image.
+  async function handleNewImageFile(file: File | Blob, source: UploadSource, displayName: string) {
+    // isHeicFile checks the filename, which only a real File has -- a
+    // pasted clipboard image is always already a plain bitmap (PNG/JPEG),
+    // never HEIC, so we only run this check for actual Files.
+    const isHeic = file instanceof File && isHeicFile(file);
 
     // HEIC photos (the default format for iPhone camera photos) sometimes
     // arrive with an empty file.type instead of "image/heic", so a plain
     // "starts with image/" check isn't enough on its own -- we also treat
     // anything isHeicFile recognises as a valid image.
-    const looksLikeImage = file.type.startsWith("image/") || isHeicFile(file);
+    const looksLikeImage = file.type.startsWith("image/") || isHeic;
     if (!looksLikeImage) {
       setError("That file doesn't look like an image. Please choose a PNG, JPG, or similar.");
       return;
@@ -233,13 +248,13 @@ export default function Home() {
     }
 
     let fileToUse: File | Blob = file;
-    let displayName = file.name;
+    let finalName = displayName;
 
-    if (isHeicFile(file)) {
+    if (isHeic) {
       setIsConvertingHeic(true);
       try {
-        fileToUse = await convertHeicToJpeg(file);
-        displayName = withJpegExtension(file.name);
+        fileToUse = await convertHeicToJpeg(file as File);
+        finalName = withJpegExtension(displayName);
       } catch (err) {
         console.error(err);
         setIsConvertingHeic(false);
@@ -256,11 +271,53 @@ export default function Home() {
       // user's computer. Nothing is uploaded to a server.
       originalUrl: URL.createObjectURL(fileToUse),
       processedUrl: null,
-      name: displayName,
+      name: finalName,
       sizeKb: Math.round(fileToUse.size / 1024),
-      source: pendingSource.current,
+      source,
     });
   }
+
+  async function handleFileInputChange(
+    event: React.ChangeEvent<HTMLInputElement>,
+    source: UploadSource
+  ) {
+    const file = event.target.files?.[0];
+    // Reset the input so choosing the same file again still triggers onChange.
+    event.target.value = "";
+    if (!file) return; // user cancelled the picker
+    await handleNewImageFile(file, source, file.name);
+  }
+
+  // Desktop clipboard paste (Ctrl+V / Cmd+V): if what's on the clipboard is
+  // an image -- exactly what Windows' Snipping Tool or macOS's screenshot
+  // shortcut puts there -- treat it the same as picking a file. If it's
+  // anything else (plain text, for instance), we never call
+  // preventDefault(), so normal pasting into the width/height fields, the
+  // save-name box, and so on, keeps working untouched.
+  useEffect(() => {
+    if (activeTab !== "create") return;
+
+    function handlePaste(event: ClipboardEvent) {
+      const items = event.clipboardData?.items;
+      if (!items) return;
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            event.preventDefault();
+            handleNewImageFile(file, "paste", "Pasted image.png");
+          }
+          return;
+        }
+      }
+    }
+
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, image]);
 
   function clearImage() {
     if (image) {
@@ -344,6 +401,26 @@ export default function Home() {
     clearPattern();
     setGenerateError(null);
     setShowTouchUp(false);
+  }
+
+  // Called by the ImageCropZoom popup once the user clicks "Apply". The
+  // cropped/zoomed result becomes the new *base* image -- replacing
+  // originalUrl, not processedUrl -- since cropping is meant to happen
+  // before background removal. Any previous background-removal result no
+  // longer applies to the newly-cropped image, so it's cleared too, same as
+  // picking a brand new image.
+  function handleApplyCrop(blob: Blob) {
+    const newOriginalUrl = URL.createObjectURL(blob);
+    setImage((prev) => {
+      if (!prev) return prev;
+      URL.revokeObjectURL(prev.originalUrl);
+      if (prev.processedUrl) URL.revokeObjectURL(prev.processedUrl);
+      return { ...prev, originalUrl: newOriginalUrl, processedUrl: null };
+    });
+    clearPattern();
+    setGenerateError(null);
+    setBgRemovalError(null);
+    setShowCropZoom(false);
   }
 
   function selectPreset(preset: BoardPreset) {
@@ -657,12 +734,23 @@ export default function Home() {
 
       {activeTab === "create" && (
       <>
-      {/* One hidden file input shared by both buttons. */}
+      {/* Two hidden file inputs -- see the comment by cameraInputRef above
+          for why there are two instead of one. */}
       <input
         ref={fileInputRef}
         type="file"
         accept="image/*"
-        onChange={handleFileChange}
+        onChange={(e) => handleFileInputChange(e, "upload")}
+        className="hidden"
+        aria-hidden="true"
+        tabIndex={-1}
+      />
+      <input
+        ref={cameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={(e) => handleFileInputChange(e, "camera")}
         className="hidden"
         aria-hidden="true"
         tabIndex={-1}
@@ -680,42 +768,47 @@ export default function Home() {
           <p className="mb-4 rounded-lg bg-blue-50 p-3 text-sm text-blue-900 dark:bg-blue-950/30 dark:text-blue-200">
             Tip: for the cleanest pattern, use a photo or screenshot with as little busy background
             as possible — a plain wall, table, or solid-color surface works best. You&apos;ll get a
-            chance to remove the background automatically later, but a simple background to start
-            gives the best results.
+            chance to crop, zoom, and remove the background in the next few steps, but a simple
+            background to start still gives the best results.
           </p>
         )}
 
         <div className="grid gap-4 sm:grid-cols-2">
           <button
             type="button"
-            onClick={() => openPicker("photo")}
+            onClick={openFilePicker}
             disabled={isConvertingHeic || isRemovingBackground}
             className="flex flex-col items-center gap-2 rounded-xl border-2 border-dashed border-pink-400 bg-pink-50 p-6 text-center transition hover:bg-pink-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-pink-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-pink-950/30 dark:hover:bg-pink-950/50"
           >
             <span className="text-3xl" aria-hidden="true">
-              📷
+              🖼️
             </span>
-            <span className="text-lg font-semibold">Upload a photo</span>
+            <span className="text-lg font-semibold">Upload a photo or screenshot</span>
             <span className="text-sm text-zinc-600 dark:text-zinc-400">
-              A picture from your camera or gallery
+              Pick anything already saved on your device
             </span>
           </button>
 
           <button
             type="button"
-            onClick={() => openPicker("screenshot")}
+            onClick={openCamera}
             disabled={isConvertingHeic || isRemovingBackground}
             className="flex flex-col items-center gap-2 rounded-xl border-2 border-solid border-sky-400 bg-sky-50 p-6 text-center transition hover:bg-sky-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-sky-950/30 dark:hover:bg-sky-950/50"
           >
             <span className="text-3xl" aria-hidden="true">
-              🖥️
+              📸
             </span>
-            <span className="text-lg font-semibold">Upload a screenshot</span>
+            <span className="text-lg font-semibold">Take a photo</span>
             <span className="text-sm text-zinc-600 dark:text-zinc-400">
-              Something you captured from a screen
+              Opens your camera right here in the app
             </span>
           </button>
         </div>
+
+        <p className="mt-3 hidden text-center text-xs text-zinc-500 sm:block dark:text-zinc-500">
+          On a computer, you can also just paste a screenshot you&apos;ve copied — click anywhere
+          on this page and press Ctrl+V (⌘V on a Mac).
+        </p>
 
         {/* Shown while an iPhone HEIC photo is being converted in the background */}
         {isConvertingHeic && (
@@ -739,13 +832,22 @@ export default function Home() {
             <h2 id="preview-heading" className="text-lg font-semibold">
               Preview
             </h2>
-            <button
-              type="button"
-              onClick={clearImage}
-              className="text-sm text-zinc-600 underline hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
-            >
-              Remove
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setShowCropZoom(true)}
+                className="text-sm font-semibold text-violet-700 underline hover:text-violet-900 dark:text-violet-400 dark:hover:text-violet-300"
+              >
+                ✂️ Crop / zoom
+              </button>
+              <button
+                type="button"
+                onClick={clearImage}
+                className="text-sm text-zinc-600 underline hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+              >
+                Remove
+              </button>
+            </div>
           </div>
 
           <div
@@ -776,8 +878,12 @@ export default function Home() {
           </div>
 
           <p className="text-sm text-zinc-600 dark:text-zinc-400">
-            {image.name} · {image.sizeKb} KB · uploaded as a{" "}
-            {image.source === "photo" ? "photo" : "screenshot"}
+            {image.name} · {image.sizeKb} KB ·{" "}
+            {image.source === "camera"
+              ? "taken with your camera"
+              : image.source === "paste"
+                ? "pasted from your clipboard"
+                : "uploaded from your device"}
             {image.processedUrl && " · edited"}
           </p>
         </section>
@@ -1227,6 +1333,14 @@ export default function Home() {
           imageUrl={activeImageUrl}
           onApply={handleApplyTouchUp}
           onCancel={() => setShowTouchUp(false)}
+        />
+      )}
+
+      {showCropZoom && image && (
+        <ImageCropZoom
+          imageUrl={image.originalUrl}
+          onApply={handleApplyCrop}
+          onCancel={() => setShowCropZoom(false)}
         />
       )}
       </>
