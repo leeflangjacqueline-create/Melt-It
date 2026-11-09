@@ -16,6 +16,12 @@ import { useEffect, useRef, useState } from "react";
 
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 4;
+// How much faster the image moves than your actual finger/mouse while
+// dragging. 1 would be exact 1:1 tracking -- technically "correct," but on
+// a small phone screen it can take a long physical drag to get all the way
+// across a zoomed-in image, which feels sluggish even though nothing is
+// actually lagging. 5 makes a short drag cover much more ground.
+const PAN_SPEED_MULTIPLIER = 5;
 const ZOOM_STEP = 0.1;
 
 type Props = {
@@ -241,8 +247,10 @@ export default function ImageCropZoom({ imageUrl, onApply, onCancel }: Props) {
   function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) return;
-    const dx = e.clientX - drag.startClientX;
-    const dy = e.clientY - drag.startClientY;
+    // Multiplied by PAN_SPEED_MULTIPLIER so the image covers more ground
+    // than your finger actually travels -- see that constant's comment.
+    const dx = (e.clientX - drag.startClientX) * PAN_SPEED_MULTIPLIER;
+    const dy = (e.clientY - drag.startClientY) * PAN_SPEED_MULTIPLIER;
     // No DOM measurement here on purpose -- everything needed (frame size,
     // scale) was already captured in dragRef when the drag started, so this
     // is pure arithmetic plus one cheap style write, and can keep up with
